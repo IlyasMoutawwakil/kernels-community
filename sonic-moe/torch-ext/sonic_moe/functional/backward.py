@@ -272,21 +272,29 @@ def _down_projection_backward_act(
         A_idx=x_gather_idx,
         dynamic_scheduler=False,
     )
-    ds[s_scatter_idx] = ds_scattered
+
+    # EP sentinel rows alias slot 0: route their writes to a trash slot (TK) and zero the values.
+    TK = s_scatter_idx.size(0)
+    row_is_valid = torch.arange(TK, device=ds.device) < expert_frequency_offset[-1]
+    safe_scatter_idx = torch.where(row_is_valid, s_scatter_idx.to(torch.long), TK)
+    safe_ds_scattered = torch.where(row_is_valid, ds_scattered, torch.zeros_like(ds_scattered))
 
     if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
+        ds_ext = torch.zeros(TK + 1, device=ds.device, dtype=ds.dtype)
+        ds_ext[safe_scatter_idx] = safe_ds_scattered.to(ds.dtype)
+        ds.copy_(ds_ext[:TK])
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
-        TK = x_gather_idx.size(0)
 
-        old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+        old_ds_partial = torch.zeros(TK + 1, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
+        old_ds_partial[safe_scatter_idx, 0] = safe_ds_scattered
+        old_ds_partial = old_ds_partial[:TK]
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        # Zero-init: the kernel below leaves sentinel lanes unwritten; they must read as zero.
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
